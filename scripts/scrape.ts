@@ -1,15 +1,6 @@
-import puppeteer from "puppeteer";
 import { Redis } from "@upstash/redis";
 
 const AFFILIATE_ID = "2001489215";
-
-const HOME_CATEGORIES = [
-  { url: "https://www.temu.com/home-textile.html", name: "Home Textile" },
-  { url: "https://www.temu.com/home-decor.html", name: "Home Decor" },
-  { url: "https://www.temu.com/kitchen-dining.html", name: "Kitchen & Dining" },
-  { url: "https://www.temu.com/storage-organization.html", name: "Storage & Organization" },
-  { url: "https://www.temu.com/bathroom.html", name: "Bathroom" },
-];
 
 interface Product {
   id: string;
@@ -45,11 +36,73 @@ function buildAffiliateUrl(goodsId: string): string {
   return `https://www.temu.com/kuiper/uk1.html?${params.toString()}`;
 }
 
-function calcDiscount(price: string, original: string): string | undefined {
-  const p = parseFloat(price.replace(/[^0-9.]/g, ""));
-  const o = parseFloat(original.replace(/[^0-9.]/g, ""));
-  if (!p || !o || o <= p) return undefined;
-  return `${Math.round((1 - p / o) * 100)}% off`;
+const HOME_SEARCHES = [
+  { keyword: "home decor", category: "Home Decor" },
+  { keyword: "kitchen organizer", category: "Kitchen & Dining" },
+  { keyword: "bedroom storage", category: "Storage" },
+  { keyword: "bathroom accessories", category: "Bathroom" },
+  { keyword: "living room decoration", category: "Living Room" },
+  { keyword: "curtains blinds", category: "Home Textile" },
+  { keyword: "sofa cushion cover", category: "Home Textile" },
+  { keyword: "wall art decoration", category: "Home Decor" },
+];
+
+const HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+  "Accept": "application/json, text/plain, */*",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Referer": "https://www.temu.com/",
+  "Origin": "https://www.temu.com",
+};
+
+async function searchTemu(keyword: string, category: string): Promise<Product[]> {
+  // Temu search API endpoint
+  const url = `https://www.temu.com/api/poppy/v1/search?q=${encodeURIComponent(keyword)}&page=1&page_size=20&sort_type=0`;
+
+  try {
+    const res = await fetch(url, { headers: HEADERS });
+    const text = await res.text();
+    console.log(`  Status: ${res.status}, length: ${text.length}`);
+
+    if (res.status !== 200) {
+      console.log(`  Response snippet: ${text.slice(0, 200)}`);
+      return [];
+    }
+
+    const data = JSON.parse(text);
+
+    // Try multiple possible response shapes
+    const goods =
+      data?.data?.goods_list ||
+      data?.result?.goods_list ||
+      data?.data?.items ||
+      data?.result?.items ||
+      [];
+
+    console.log(`  Found ${goods.length} items`);
+
+    return goods.slice(0, 15).map((g: Record<string, unknown>) => {
+      const id = String(g.goods_id || g.id || "");
+      const price = g.price_info as Record<string, unknown> || {};
+      const priceVal = `$${((Number(price.price) || Number(g.price) || 0) / 100).toFixed(2)}`;
+      const origVal = price.origin_price ? `$${(Number(price.origin_price) / 100).toFixed(2)}` : undefined;
+      const imgs = (g.images as string[]) || [];
+      const img = typeof g.image === "string" ? g.image : imgs[0] || "";
+      const title = String(g.goods_name || g.title || g.name || "Home Product");
+
+      let discount: string | undefined;
+      if (origVal) {
+        const p = parseFloat(priceVal.replace("$", ""));
+        const o = parseFloat(origVal.replace("$", ""));
+        if (o > p) discount = `${Math.round((1 - p / o) * 100)}% off`;
+      }
+
+      return { id, title, price: priceVal, originalPrice: origVal, discount, image: img, affiliateUrl: buildAffiliateUrl(id), category, scrapedAt: new Date().toISOString() };
+    }).filter((p: Product) => p.id);
+  } catch (err) {
+    console.error(`  Error: ${err}`);
+    return [];
+  }
 }
 
 async function scrape(): Promise<void> {
@@ -58,88 +111,15 @@ async function scrape(): Promise<void> {
     token: process.env.UPSTASH_REDIS_REST_TOKEN!,
   });
 
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-  });
-
   const newProducts: Product[] = [];
 
-  for (const cat of HOME_CATEGORIES) {
-    console.log(`Scraping: ${cat.name}`);
-    try {
-      const page = await browser.newPage();
-      await page.setUserAgent(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
-      );
-      await page.setViewport({ width: 1280, height: 900 });
-      await page.goto(cat.url, { waitUntil: "networkidle2", timeout: 30000 });
-      await new Promise((r) => setTimeout(r, 4000));
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
-      await new Promise((r) => setTimeout(r, 3000));
-
-      // Debug: dump page title + first 2000 chars of HTML
-      const debugInfo = await page.evaluate(() => ({
-        title: document.title,
-        url: window.location.href,
-        bodySnippet: document.body.innerHTML.slice(0, 2000),
-        linkCount: document.querySelectorAll("a").length,
-      }));
-      console.log("  Title:", debugInfo.title);
-      console.log("  URL:", debugInfo.url);
-      console.log("  Links:", debugInfo.linkCount);
-      console.log("  HTML snippet:", debugInfo.bodySnippet.slice(0, 500));
-
-      // Also try to find any anchor with goods_id anywhere
-      const items = await page.evaluate((max: number) => {
-        const results: Array<{ id: string; title: string; price: string; originalPrice: string; image: string }> = [];
-
-        // Try all anchor tags with goods_id
-        const links = Array.from(document.querySelectorAll("a[href*='goods_id']")) as HTMLAnchorElement[];
-        for (const link of links) {
-          if (results.length >= max) break;
-          const m = link.href.match(/goods_id=(\d+)/);
-          if (!m) continue;
-          // Walk up to find product card container
-          const card = link.closest('li, article, [class*="card"], [class*="item"], [class*="product"], [class*="goods"]') || link.parentElement;
-          const imgEl = card?.querySelector("img") as HTMLImageElement | null;
-          const allText = card?.querySelectorAll('[class*="price"], span, em');
-          const prices = Array.from(allText || []).map(el => el.textContent?.trim()).filter(Boolean);
-          results.push({
-            id: m[1],
-            title: imgEl?.alt || link.textContent?.trim() || "Home Product",
-            price: prices[0] || "",
-            originalPrice: prices[1] || "",
-            image: imgEl?.src || "",
-          });
-        }
-        return results;
-      }, 20);
-
-      for (const item of items) {
-        newProducts.push({
-          id: item.id,
-          title: item.title,
-          price: item.price,
-          originalPrice: item.originalPrice || undefined,
-          discount: calcDiscount(item.price, item.originalPrice),
-          image: item.image,
-          affiliateUrl: buildAffiliateUrl(item.id),
-          category: cat.name,
-          scrapedAt: new Date().toISOString(),
-        });
-      }
-
-      console.log(`  Found ${items.length} products`);
-      await page.close();
-    } catch (err) {
-      console.error(`  Failed: ${err}`);
-    }
+  for (const { keyword, category } of HOME_SEARCHES) {
+    console.log(`Searching: "${keyword}"`);
+    const results = await searchTemu(keyword, category);
+    newProducts.push(...results);
+    await new Promise((r) => setTimeout(r, 1000));
   }
 
-  await browser.close();
-
-  // Merge with existing, keep newest 500
   const existing = (await redis.get<Product[]>("temu:products")) || [];
   const existingIds = new Set(existing.map((p) => p.id));
   const fresh = newProducts.filter((p) => !existingIds.has(p.id));
