@@ -78,12 +78,17 @@ async function scrape(): Promise<void> {
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
       await new Promise((r) => setTimeout(r, 3000));
 
-      // Debug: log all links with goods_id found on page
-      const debugLinks = await page.evaluate(() => {
-        const links = Array.from(document.querySelectorAll("a[href*='goods_id']")) as HTMLAnchorElement[];
-        return links.slice(0, 3).map(a => ({ href: a.href, parent: a.parentElement?.className || "" }));
-      });
-      console.log("  Debug links:", JSON.stringify(debugLinks));
+      // Debug: dump page title + first 2000 chars of HTML
+      const debugInfo = await page.evaluate(() => ({
+        title: document.title,
+        url: window.location.href,
+        bodySnippet: document.body.innerHTML.slice(0, 2000),
+        linkCount: document.querySelectorAll("a").length,
+      }));
+      console.log("  Title:", debugInfo.title);
+      console.log("  URL:", debugInfo.url);
+      console.log("  Links:", debugInfo.linkCount);
+      console.log("  HTML snippet:", debugInfo.bodySnippet.slice(0, 500));
 
       // Also try to find any anchor with goods_id anywhere
       const items = await page.evaluate((max: number) => {
