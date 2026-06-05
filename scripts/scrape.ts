@@ -78,27 +78,36 @@ async function scrape(): Promise<void> {
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2));
       await new Promise((r) => setTimeout(r, 3000));
 
+      // Debug: log all links with goods_id found on page
+      const debugLinks = await page.evaluate(() => {
+        const links = Array.from(document.querySelectorAll("a[href*='goods_id']")) as HTMLAnchorElement[];
+        return links.slice(0, 3).map(a => ({ href: a.href, parent: a.parentElement?.className || "" }));
+      });
+      console.log("  Debug links:", JSON.stringify(debugLinks));
+
+      // Also try to find any anchor with goods_id anywhere
       const items = await page.evaluate((max: number) => {
         const results: Array<{ id: string; title: string; price: string; originalPrice: string; image: string }> = [];
-        const cards = document.querySelectorAll('[class*="goods-item"], [class*="product-item"], [data-type="goods"]');
-        cards.forEach((card) => {
-          if (results.length >= max) return;
-          const link = card.querySelector("a[href*='goods_id']") as HTMLAnchorElement;
-          const imgEl = card.querySelector("img") as HTMLImageElement;
-          const titleEl = card.querySelector('[class*="title"], [class*="name"]');
-          const priceEl = card.querySelector('[class*="price"]');
-          const origPriceEl = card.querySelector('[class*="origin-price"], [class*="original"]');
-          if (!link || !imgEl) return;
+
+        // Try all anchor tags with goods_id
+        const links = Array.from(document.querySelectorAll("a[href*='goods_id']")) as HTMLAnchorElement[];
+        for (const link of links) {
+          if (results.length >= max) break;
           const m = link.href.match(/goods_id=(\d+)/);
-          if (!m) return;
+          if (!m) continue;
+          // Walk up to find product card container
+          const card = link.closest('li, article, [class*="card"], [class*="item"], [class*="product"], [class*="goods"]') || link.parentElement;
+          const imgEl = card?.querySelector("img") as HTMLImageElement | null;
+          const allText = card?.querySelectorAll('[class*="price"], span, em');
+          const prices = Array.from(allText || []).map(el => el.textContent?.trim()).filter(Boolean);
           results.push({
             id: m[1],
-            title: titleEl?.textContent?.trim() || imgEl.alt || "Home Product",
-            price: priceEl?.textContent?.trim() || "",
-            originalPrice: origPriceEl?.textContent?.trim() || "",
-            image: imgEl.src || "",
+            title: imgEl?.alt || link.textContent?.trim() || "Home Product",
+            price: prices[0] || "",
+            originalPrice: prices[1] || "",
+            image: imgEl?.src || "",
           });
-        });
+        }
         return results;
       }, 20);
 
